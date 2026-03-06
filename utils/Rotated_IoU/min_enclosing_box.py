@@ -180,10 +180,10 @@ if __name__ == "__main__":
     corners2 = box2corners(*box2) # 4, 2
     tensor1 = torch.FloatTensor(np.concatenate([corners1, corners2], axis=0))
     w, h, a, i = smallest_bounding_box(tensor1, True)
-    print("width:", w.item(), ". length:", h.item())
-    print("area: ", a.item())
-    print("index in 26 candidates: ", i.item())
-    print("colliniear with points: ", LINES[i.item()])
+    # print("width:", w.item(), ". length:", h.item())
+    # print("area: ", a.item())
+    # print("index in 26 candidates: ", i.item())
+    # print("colliniear with points: ", LINES[i.item()])
     plt.scatter(corners1[:, 0], corners1[:, 1])
     plt.scatter(corners2[:, 0], corners2[:, 1])
     for i in range(corners1.shape[0]):

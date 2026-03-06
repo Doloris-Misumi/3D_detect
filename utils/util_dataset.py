@@ -252,7 +252,7 @@ def func_show_gaussian_confidence_polar(p_pline, arr_range=None, arr_azimuth=Non
     cv2.waitKey(0)
 
 def func_show_heatmap_polar_with_bbox(p_pline, idx_datum, scale):
-    print('Takes quiet a lot to transform due to inverse transform')
+    # print('Takes quiet a lot to transform due to inverse transform')
     label = p_pline.get_label_bboxes(p_pline[idx_datum]['meta']['path_label'], p_pline[idx_datum]['calib_info'])
     arr_yx_bbox = p_pline.show_radar_tensor_bev(p_pline[idx_datum], bboxes=label, \
                 roi_x=[0,0.2,120], roi_y=[-100,0.2,100], is_return_bbox_bev_tensor=True)
@@ -420,10 +420,10 @@ def func_show_sliced_radar_cube(p_pline, dict_item, bboxes=None, magnifying=4, i
     rdr_cube, rdr_cube_cnt = p_pline.get_cube(dict_item['meta']['path_rdr_cube'], mode=0)
     
     ### Infomation for pre-processing ###
-    print(bboxes)
+    # print(bboxes)
     arr_x, arr_y, arr_z = p_pline.arr_x_cb, p_pline.arr_y_cb, p_pline.arr_z_cb
     num_z, num_y, num_x = rdr_cube.shape
-    print(num_z, num_y, num_x)
+    # print(num_z, num_y, num_x)
     ### Infomation for pre-processing ###
     
     ### Change here like show radar cube function! ###
@@ -615,7 +615,7 @@ def func_show_rdr_pc_tesseract(p_pline, dict_item, bboxes=None, cfar_params = [2
     ]
 
     num_points, _ = pc_radar.shape
-    print(f'number of points = {num_points}')
+    # print(f'number of points = {num_points}')
     
     rdr = get_pc_for_vis(pc_radar, 'black')
     line_sets_bbox = get_bbox_for_vis(bboxes)

@@ -15,6 +15,7 @@ class ImageClsBackbone(nn.Module):
         self.adjust = nn.Linear(220, 256)
         self.gap = nn.AdaptiveAvgPool1d(1)
         self.fc = nn.Linear(64, 7)
+        self.ct_proj = nn.Linear(64, 512) # CLIP dim
         
     def forward(self, dict_item):
         img = dict_item['cam_front_img'].cuda()
@@ -25,6 +26,11 @@ class ImageClsBackbone(nn.Module):
         x3 = x3.view(b, 64, -1) 
         x4 = self.adjust(x3) # b, 64, 256
         x5 = self.gap(x4) # b, 64, 1
+        
+        # Project to text embedding dimension (e.g., 512 for CLIP) for Condition Token
+        ct = self.ct_proj(x5.squeeze(-1)) # b, 512
+        dict_item['img_embedding'] = ct
+        
         x6 = self.fc(x5.squeeze())
         dict_item['img_cls_output'] = x6
         dict_item['img_cls_gap'] = x5

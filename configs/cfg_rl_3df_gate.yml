@@ -33,8 +33,8 @@ DATASET:
   DIR:
     ### Server room 1 ###
     # The directory order may affect the performance due to sampling order
-    LIST_DIR: ['/mnt/ssd4tb1', '/mnt/ssd4tb2','/mnt/ssd4tb3','/mnt/ssd4tb4']
-    DIR_DOPPLER_CB:  # Total 2.2 TB
+    LIST_DIR: ['/home/hongsheng/k_radar_dataset']
+    DIR_DOPPLER_CB: 
     DIR_SPARSE_CB: 
     ### Server room 1 ###
 
@@ -190,28 +190,47 @@ MODEL:
 
   IMG_CLS:
     NAME: 'ImageClsBackbone'
-    MODEL_PATH: './models/img_cls/best008_85.pth' # './models/img_cls/best043_91.pth'
+    MODEL_PATH: './models/img_cls/best007_98.pth' # './models/img_cls/best015_100.pth'
 
   BACKBONE:
     TYPE: '3D'
-    NAME: 'RL3DFBackbone_knngate'
+    NAME: 'RL3DFBackbone_Branching'
     ENCODING:
       CHANNEL: [64, 128, 256]
-      STRIDE:  [1, 2, 2]
       PADDING: [1, 1, 1]
+      STRIDE: [1, 2, 2]
+    
     TO_BEV:
-      IS_Z_EMBED: False
+      IS_Z_EMBED: False # if False, it uses 2D Conv
       CHANNEL: [256, 256, 256]
-      KERNEL_SIZE: [3, 6, 12]
-      STRIDE:  [1, 2, 4]
-      PADDING: [1, 2, 4]
+      KERNEL_SIZE: [[1,1], [2,2], [4,4]]
+      STRIDE: [[1,1], [2,2], [4,4]]
+      PADDING: [[0,0], [0,0], [0,0]]
 
   HEAD:
-    NAME: 'RdrSpcubeHead'
-    DIM: 1536 # 768
-    BOX_CODE: ['xc', 'yc', 'zc', 'xl', 'yl', 'zl', 'cos', 'sin']
-    BG_WEIGHT: 1.
-    NMS_OVERLAP_THRESHOLD: 0.1
+    NAME: 'TransformerDecoderHead'
+    DIM: 1536 # 256 * 6 (L+R+F) * (1+1+1) ? Wait, let's check backbone output
+    # Backbone outputs concatenation of [bev_feat_R, bev_feat_L] or [bev_feat_R, bev_feat_F] or [zeros, bev_feat_L]
+    # Each bev_feat is 256 channels.
+    # final_bev is cat(R, L) dim. 
+    # R is cat(list_bev_R). list_bev_R has 3 levels? No, just one final output?
+    # Actually RL3DFBackbone_Branching returns dict_item['bev_feat']
+    # Let's re-check the backbone code.
+    # It concatenates 3 levels of features?
+    # No, it seems to be just accumulating list_bev and then cat.
+    # If list_bev has 3 elements (from 3 encoder layers), and each is 256 channels.
+    # Then bev_feat_R is 256*3 = 768.
+    # final_bev is cat(R, L) -> 768 * 2 = 1536.
+    
+    HIDDEN_DIM: 256
+    NUM_QUERIES: 100
+    NHEAD: 8
+    NUM_LAYERS: 3
+    
+    # Original anchors config (kept for reference or if we switch back)
+    NMS_OVERLAP_THRESHOLD: 0.3
+    BG_WEIGHT: 2
+    BOX_CODE: ['x', 'y', 'z', 'w', 'l', 'h', 'sin', 'cos'] # 8
 
   ROI_HEAD:
 
@@ -232,16 +251,16 @@ MODEL:
 OPTIMIZER: # Training
   NAME: 'Adam'
 
-  LR: 0.001
-  MIN_LR: 0.0001 # for scheduler
+  LR: 0.0001
+  MIN_LR: 0.00001 # for scheduler
   BETAS: [0.9, 0.999]
   WEIGHT_DECAY: 0.01
   MOMENTUM: 0.9
 
-  BATCH_SIZE: 4
-  NUM_WORKERS: 4 # 0 for dataloader_error / 4 for batch 16
+  BATCH_SIZE: 16
+  NUM_WORKERS: 8 # 0 for dataloader_error / 4 for batch 16
 
-  MAX_EPOCH: 20
+  MAX_EPOCH: 100
   
   SCHEDULER: 'CosineAnnealingLR' # in [None (empty), 'LambdaLR', 'CosineAnnealingLR']
   TYPE_TOTAL_ITER: 'every' # in ['every', 'all'] / every epoch
@@ -252,13 +271,13 @@ VAL:
   IS_VALIDATE: True
   IS_CONSIDER_VAL_SUBSET: True
   VAL_PER_EPOCH_SUBSET: 1
-  NUM_SUBSET: 5834
-  VAL_PER_EPOCH_FULL: 100 # epoch for validate full dataset
+  NUM_SUBSET: 298 # 5834
+  VAL_PER_EPOCH_FULL: 5 # epoch for validate full dataset
 
-  TRAIN_AUG: False
+  TRAIN_AUG: True
   TEST_AUG: False
 
-  LIST_VAL_CONF_THR: [0.3]
+  LIST_VAL_CONF_THR: [0.01, 0.1, 0.3]
   LIST_VAL_IOU: [0.7, 0.5, 0.3]
   # This is for logging, change the iou threshold in 'utils/kitti_eval'
 

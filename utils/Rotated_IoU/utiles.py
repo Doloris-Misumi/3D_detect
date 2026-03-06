@@ -256,7 +256,7 @@ def test_box_intersection(box1, box2):
     inters_lin = np.reshape(inters, (-1, 2))
     mask_lin = np.reshape(mask, (-1, ))
     inter_points = inters_lin[mask_lin, :]
-    print("find %d intersections"%num_inters)
+    # print("find %d intersections"%num_inters)
 
     corners1 = box2corners(*box1)
     corners2 = box2corners(*box2)
@@ -289,8 +289,8 @@ def test_point_in_box():
 
 def test_intersection_area(box1, box2):
     area, corners = box_intersection_area(box1, box2)
-    print(area) 
-    print(corners)
+    # print(area) 
+    # print(corners)
     plt.figure()
     plt.scatter(corners[:, 0], corners[:, 1])
     for i in range(corners.shape[0]):

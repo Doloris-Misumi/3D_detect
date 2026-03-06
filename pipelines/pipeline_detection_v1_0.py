@@ -16,6 +16,9 @@ from torch.utils.data import Subset
 import cv2
 import matplotlib.pyplot as plt
 import time
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 
 # Ingnore numba warning
 from numba.core.errors import NumbaWarning
@@ -49,6 +52,19 @@ class PipelineDetection_v1_0():
         self.cfg = cfg_from_yaml_file(path_cfg, cfg)
         self.mode = mode
         # self.update_cfg_regarding_mode()
+        
+        # Distributed Setup
+        self.local_rank = int(os.environ.get("LOCAL_RANK", -1))
+        self.world_size = int(os.environ.get("WORLD_SIZE", 1))
+        self.is_distributed = self.local_rank != -1
+        
+        if self.is_distributed:
+            torch.cuda.set_device(self.local_rank)
+            dist.init_process_group(backend='nccl', init_method='env://')
+            self.device = torch.device(f'cuda:{self.local_rank}')
+            print(f'* Init process group: rank {self.local_rank}/{self.world_size}')
+        else:
+            self.device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
         if self.cfg.GENERAL.SEED is not None:
             try:
@@ -65,18 +81,37 @@ class PipelineDetection_v1_0():
             self.cfg.DATASET.NUM = len(self.dataset_test)
         # print(self.cfg.DATASET.CLASS_INFO.NUM_CLS) # check if it is updated
 
-        self.network = build_network(self).cuda()
+        self.network = build_network(self).to(self.device)
         self.optimizer = build_optimizer(self, self.network)
         self.scheduler = build_scheduler(self, self.optimizer)
         self.epoch_start = 0
 
+        # DDP Wrapping
+        if self.is_distributed:
+            # self.network = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.network)
+            self.network = DDP(self.network, device_ids=[self.local_rank], output_device=self.local_rank, find_unused_parameters=True)
+            # Scale LR for distributed training
+            # for param_group in self.optimizer.param_groups:
+            #     param_group['lr'] *= self.world_size
+        
         # Logging
+        self.is_logging = False
         if self.cfg.GENERAL.LOGGING.IS_LOGGING:
-            self.set_logging(path_cfg)
+            if self.is_distributed:
+                if self.local_rank == 0:
+                    self.set_logging(path_cfg)
+            else:
+                self.set_logging(path_cfg)
 
         # Validation
         if self.cfg.VAL.IS_VALIDATE:
-            self.set_validate()
+            if self.is_distributed:
+                if self.local_rank == 0:
+                    self.set_validate()
+                else:
+                    self.is_validate = False
+            else:
+                self.set_validate()
         else:
             self.is_validate = False
         
@@ -235,9 +270,13 @@ class PipelineDetection_v1_0():
     def train_network(self, is_shuffle=True):
         self.network.train()
 
+        sampler = DistributedSampler(self.dataset_train, shuffle=is_shuffle) if self.is_distributed else None
+        shuffle = is_shuffle and (sampler is None)
+
         data_loader_train = torch.utils.data.DataLoader(self.dataset_train, \
-            batch_size = self.cfg.OPTIMIZER.BATCH_SIZE, shuffle = is_shuffle, \
+            batch_size = self.cfg.OPTIMIZER.BATCH_SIZE, shuffle = shuffle, \
             collate_fn = self.dataset_train.collate_fn,
+            sampler=sampler,
             num_workers = self.cfg.OPTIMIZER.NUM_WORKERS, drop_last = True)
 
         epoch_start = self.epoch_start
@@ -247,29 +286,61 @@ class PipelineDetection_v1_0():
             idx_log_iter = 0 if self.log_iter_start is None else self.log_iter_start
 
         for epoch in range(epoch_start, epoch_end):
+            if self.is_distributed:
+                sampler.set_epoch(epoch)
+            
             torch.cuda.empty_cache()
-            print(f'* Training epoch = {epoch}/{epoch_end-1}')
+            if self.local_rank == 0 or not self.is_distributed:
+                print(f'* Training epoch = {epoch}/{epoch_end-1}')
             if self.is_logging:
                 print(f'* Logging path = {self.path_log}')
             
             self.network.train()
-            self.network.training = True
+            # Handle DDP .module access if needed, but training=True is on the wrapper too
+            if self.is_distributed:
+                self.network.module.training = True
+            else:
+                self.network.training = True
+            
             avg_loss = []
-            for idx_iter, dict_datum in enumerate(tqdm(data_loader_train)):
+            
+            # Only show tqdm on rank 0
+            if self.local_rank == 0 or not self.is_distributed:
+                pbar = tqdm(data_loader_train)
+            else:
+                pbar = data_loader_train
+                
+            for idx_iter, dict_datum in enumerate(pbar):
                 if (idx_iter % 50) == 49:
                     torch.cuda.empty_cache()
+                
+                # In DDP, forward call is on self.network (the wrapper)
+                dict_datum['epoch'] = epoch
+                dict_datum['idx_iter'] = idx_iter
+                dict_datum['local_rank'] = self.local_rank
                 dict_net = self.network(dict_datum)
-                loss = self.network.head.loss(dict_net)
-
-                ### Loss for additional head ### 
-                if hasattr(self.network, 'point_head'): # PVRCNN_PP
-                    point_loss = self.network.point_head.loss(dict_net)
-                    loss += point_loss
-
-                if hasattr(self.network, 'roi_head'): # PVRCNN_PP
-                    roi_loss = self.network.roi_head.loss(dict_net)
-                    loss += roi_loss
-                ### Loss for additional head ### 
+                
+                # Loss calculation
+                # Accessing .head requires .module in DDP
+                if self.is_distributed:
+                    loss = self.network.module.head.loss(dict_net)
+                    if hasattr(self.network.module, 'point_head'):
+                        point_loss = self.network.module.point_head.loss(dict_net)
+                        loss += point_loss
+                    if hasattr(self.network.module, 'roi_head'):
+                        roi_loss = self.network.module.roi_head.loss(dict_net)
+                        loss += roi_loss
+                else:
+                    loss = self.network.head.loss(dict_net)
+                    if hasattr(self.network, 'point_head'): # PVRCNN_PP
+                        point_loss = self.network.point_head.loss(dict_net)
+                        loss += point_loss
+                    if hasattr(self.network, 'roi_head'): # PVRCNN_PP
+                        roi_loss = self.network.roi_head.loss(dict_net)
+                        loss += roi_loss 
+                
+                if 'contrastive_loss' in dict_net:
+                    loss += dict_net['contrastive_loss']
                 
                 try:
                     log_avg_loss = loss.cpu().detach().item()
@@ -301,17 +372,19 @@ class PipelineDetection_v1_0():
                         lr = self.scheduler.get_last_lr()
                         self.log_train_iter.add_scalar(f'train/learning_rate', lr[0], idx_log_iter)
 
-            if self.is_save_model:
+            if getattr(self, 'is_save_model', False):
                 # epoch: indexing from 0
                 path_dict_model = os.path.join(self.path_log, 'models', f'model_{epoch}.pt')
                 path_dict_util = os.path.join(self.path_log, 'utils', f'util_{epoch}.pt')
 
                 if (epoch+1) % self.interval_epoch_model == 0:
-                    torch.save(self.network.state_dict(), path_dict_model)
+                    model_to_save = self.network.module if self.is_distributed else self.network
+                    torch.save(model_to_save.state_dict(), path_dict_model)
                 if (epoch+1) % self.interval_epoch_util == 0:
+                    model_to_save = self.network.module if self.is_distributed else self.network
                     dict_util = {
                         'epoch': epoch,
-                        'model_state_dict': self.network.state_dict(),
+                        'model_state_dict': model_to_save.state_dict(),
                         'optimizer_state_dict': self.optimizer.state_dict(),
                         'idx_log_iter': idx_log_iter, 
                     }
@@ -355,7 +428,8 @@ class PipelineDetection_v1_0():
         
         for dict_datum in data_loader:
             dict_out = self.network(dict_datum)
-            dict_out = self.network.list_modules[-1].get_nms_pred_boxes_for_single_sample(dict_out, conf_thr, is_nms)
+            model_to_eval = self.network.module if self.is_distributed else self.network
+            dict_out = model_to_eval.list_modules[-1].get_nms_pred_boxes_for_single_sample(dict_out, conf_thr, is_nms)
             ### Vis data ###
             pc_lidar = dict_datum['ldr_pc_64']
             # rdr_spcube = dict_datum['rdr_sparse_cube']
@@ -517,13 +591,17 @@ class PipelineDetection_v1_0():
 
     # V2
     def validate_kitti(self, epoch=None, list_conf_thr=None, is_subset=False):
+        if self.is_distributed and self.local_rank != 0:
+            return
+
         self.network.eval()
 
         with torch.no_grad():
             ### Check is_validate with small dataset ###
             if is_subset:
-                is_shuffle = True
-                minival_id = list(range(0, 17500, 3)) # num:5834
+                is_shuffle = False
+                # minival_id = list(range(0, 17500, 3)) # num:5834
+                minival_id = list(range(0, len(self.dataset_test), 3))
                 tqdm_bar = tqdm(total=len(minival_id), desc='* MiniVal (Subset): ')
                 log_header = 'minival'
                 dataset_test1 = Subset(self.dataset_test, minival_id)
@@ -559,6 +637,8 @@ class PipelineDetection_v1_0():
                     break
                 
                 try:
+                    dict_datum['idx_iter'] = idx_datum
+                    dict_datum['local_rank'] = self.local_rank
                     dict_out = self.network(dict_datum) # inference
                     is_feature_inferenced = True
                 except:
@@ -579,7 +659,8 @@ class PipelineDetection_v1_0():
                         os.makedirs(temp_dir, exist_ok=True)
                         
                     if is_feature_inferenced:
-                        dict_out = self.network.list_modules[-1].get_nms_pred_boxes_for_single_sample(dict_out, conf_thr, is_nms=True)
+                        model_to_eval = self.network.module if self.is_distributed else self.network
+                        dict_out = model_to_eval.list_modules[-1].get_nms_pred_boxes_for_single_sample(dict_out, conf_thr, is_nms=True)
                     else:
                         dict_out = update_dict_feat_not_inferenced(dict_out) # mostly sleet for lpc (e.g. no measurement)
 
@@ -654,6 +735,9 @@ class PipelineDetection_v1_0():
             ### Validate per conf ###
             
     def validate_kitti_conditional(self, epoch=None, list_conf_thr=None, is_subset=False, is_print_memory=False):
+        if self.is_distributed and self.local_rank != 0:
+            return
+            
         self.network.eval()
 
         with torch.no_grad():
@@ -833,7 +917,8 @@ class PipelineDetection_v1_0():
                     os.makedirs(preds_dir_weather, exist_ok=True)
 
                     if is_feature_inferenced:
-                        dict_out_current = self.network.list_modules[-1].get_nms_pred_boxes_for_single_sample(dict_out, conf_thr, is_nms=True)
+                        model_to_eval = self.network.module if self.is_distributed else self.network
+                        dict_out_current = model_to_eval.list_modules[-1].get_nms_pred_boxes_for_single_sample(dict_out, conf_thr, is_nms=True)
                     else:
                         dict_out_current = update_dict_feat_not_inferenced(dict_out) # mostly sleet for lpc (e.g. no measurement)
 

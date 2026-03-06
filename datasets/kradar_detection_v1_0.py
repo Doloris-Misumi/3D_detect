@@ -43,6 +43,10 @@ class KRadarDetection_v1_0(Dataset):
         for dir_seq in self.cfg.DATASET.DIR.LIST_DIR:
             list_seq = os.listdir(dir_seq)
             for seq in list_seq:
+                if not os.path.isdir(os.path.join(dir_seq, seq)):
+                    continue
+                if seq not in self.dict_split.keys():
+                    continue
                 seq_label_paths = sorted(glob(osp.join(dir_seq, seq, 'info_label', '*.txt')))
                 seq_label_paths = list(filter(lambda x: (x.split('/')[-1].split('.')[0] in self.dict_split[seq]), seq_label_paths))
                 self.list_path_label.extend(seq_label_paths)
@@ -176,6 +180,11 @@ class KRadarDetection_v1_0(Dataset):
                 dict_path = self.get_path_data_from_path_label(path_label)
                 dict_item['meta']['path'] = dict_path
                 dict_item['meta']['desc'] = self.get_description(dict_path['path_desc'])
+                # Condition Prompt
+                weather = dict_item['meta']['desc']['climate']
+                time_of_day = dict_item['meta']['desc']['capture_time']
+                dict_item['meta']['condition_prompt'] = f"A {weather} driving scene at {time_of_day} time"
+                
                 dict_item['meta']['image_cls_label'] = self.weather_list.index(dict_item['meta']['desc']['climate'])
                 calib_info = self.get_calib_info(dict_path['path_calib'])
                 dict_item['calib'] = calib_info
@@ -410,7 +419,42 @@ class KRadarDetection_v1_0(Dataset):
         return list_objects
 
     def get_spcube(self, path_spcube):
-        return np.load(path_spcube)
+        data = np.load(path_spcube)
+        if data.shape[0] == 2 and len(data.shape) == 4:
+            # Handle dense (2, 256, 107, 37) -> (N, 4)
+            # Assume (C, X, Y, Z) based on dims
+            # X: 256, Y: 107, Z: 37
+            # Grid Size: 0.4
+            
+            # C, X, Y, Z
+            power = data[0]
+            
+            # Filter to sparsify (Keep top 30% to be less sparse than 10%)
+            # Using torch for speed if possible, but numpy is fine here
+            threshold = np.quantile(power, 0.7) # Keep top 30% to ensure constant N for stacking
+            # threshold = 2.0 # Fixed threshold results in variable N -> collate error
+            
+            # Get indices
+            x_ind, y_ind, z_ind = np.where(power > threshold)
+            
+            # Values
+            p_val = power[x_ind, y_ind, z_ind]
+            
+            # Coordinates
+            grid_size = self.cfg.DATASET.RDR_SP_CUBE.GRID_SIZE
+            #grid_size = 0.4
+            x_coord = x_ind * grid_size
+            # Center Y and Z
+            y_center = (data.shape[2] * grid_size) / 2
+            z_center = (data.shape[3] * grid_size) / 2
+            y_coord = y_ind * grid_size - y_center + (grid_size/2)
+            z_coord = z_ind * grid_size - z_center + (grid_size/2)
+            
+            # Stack: (N, 4) -> x, y, z, p
+            sparse_data = np.stack([x_coord, y_coord, z_coord, p_val], axis=-1)
+            return sparse_data
+            
+        return data
 
     def get_tesseract(self, path_tesseract, is_in_DRAE=True, is_in_3d=False, is_in_log=False):
         # Otherwise you make the input as 4D, you should not get the data as log scale
@@ -763,8 +807,9 @@ class KRadarDetection_v1_0(Dataset):
             # print('* debug: total points = ', sparse_rdr_cube.shape)
             
             path_rdr_cube = dict_item['meta']['path']['rdr_cube']
-            name_save_file = 'sp' + path_rdr_cube.split('/')[-1].split('.')[0]
-            import pdb; pdb.set_trace()
+            # name_save_file = 'sp' + path_rdr_cube.split('/')[-1].split('.')[0]
+            name_save_file = path_rdr_cube.split('/')[-1].split('.')[0]
+            # import pdb; pdb.set_trace()
             if is_save_in_same_folder:
                 dir_save = os.path.join('/'.join(path_rdr_cube.split('/')[:-2]), name_sparse_cube)
             else: # default
@@ -806,7 +851,9 @@ class KRadarDetection_v1_0(Dataset):
                 path_radar_sparse_cube = os.path.join(self.dir_sp, path_header[-1], self.name_sp_cube, 'spcube_'+radar_idx+'.npy')
             else:
                 # path_radar_sparse_cube = '/'+os.path.join(*path_header, self.name_sp_cube, 'spcube_'+radar_idx+'.npy')
-                path_radar_sparse_cube = '/'+os.path.join(*path_header, self.name_sp_cube, 'cube_'+radar_idx+'.npy')
+                # path_radar_sparse_cube = '/'+os.path.join(*path_header, self.name_sp_cube, 'cube_'+radar_idx+'.npy')
+                path_radar_sparse_cube = '/'+os.path.join(*path_header, 'sparse_cube', 'cube_'+radar_idx+'.npy')
+
 
         ### Folders in seq.zip file
         path_radar_tesseract = '/'+os.path.join(*path_header, 'radar_tesseract', 'tesseract_'+radar_idx+'.mat')
@@ -852,6 +899,12 @@ class KRadarDetection_v1_0(Dataset):
             dict_path = self.get_path_data_from_path_label(path_label)
             dict_item['meta']['path'] = dict_path
             dict_item['meta']['desc'] = self.get_description(dict_path['path_desc'])
+            
+            # Condition Prompt
+            weather = dict_item['meta']['desc']['climate']
+            time_of_day = dict_item['meta']['desc']['capture_time']
+            dict_item['meta']['condition_prompt'] = f"A {weather} driving scene at {time_of_day} time"
+
             dict_item['meta']['image_cls_label'] = self.weather_list.index(dict_item['meta']['desc']['climate'])
             calib_info = self.get_calib_info(dict_path['path_calib'])
             dict_item['calib'] = calib_info
@@ -879,8 +932,10 @@ class KRadarDetection_v1_0(Dataset):
                 dict_item['cam_front_img'] = self.get_img(dict_path['cam_front_img'])
             ### Get only required data ###
             return dict_item
-        except:
-            print('* Exception error (Dataset): __getitem__ error')
+        except Exception as e:
+            print(f'* Exception error (Dataset): __getitem__ error: {str(e)}')
+            import traceback
+            traceback.print_exc()
             return None
 
     def get_img(self, img_path):
@@ -903,6 +958,7 @@ class KRadarDetection_v1_0(Dataset):
         
         dict_batch['label'] = []
         dict_batch['num_objs'] = []
+        dict_batch['condition_prompts'] = [] # Add prompt list
         
         ### Stack to list ###
         for batch_id, dict_temp in enumerate(list_dict_item):
@@ -922,6 +978,12 @@ class KRadarDetection_v1_0(Dataset):
             num_objects = len(list_objects)
             dict_batch['label'].append(list_objects)
             dict_batch['num_objs'].append(num_objects)
+            
+            # Collate prompts
+            if 'condition_prompt' in dict_temp['meta']:
+                dict_batch['condition_prompts'].append(dict_temp['meta']['condition_prompt'])
+            else:
+                dict_batch['condition_prompts'].append("") # Empty fallback
         ### Stack to list ###
 
         ### Processing with keys ###
@@ -930,7 +992,7 @@ class KRadarDetection_v1_0(Dataset):
                 pass
             else:
                 # Point cloud
-                if k == 'ldr_pc_64': 
+                if k in ['ldr_pc_64', 'rdr_sparse_cube']: 
                     pass
                     batch_indices = []
                     for batch_id, pc in enumerate(dict_batch[k]):

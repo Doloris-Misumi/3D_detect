@@ -253,5 +253,5 @@ if __name__ == "__main__":
     tensor1 = torch.FloatTensor(box3d1).unsqueeze(0).unsqueeze(0).cuda()
     tensor2 = torch.FloatTensor(box3d2).unsqueeze(0).unsqueeze(0).cuda()
     giou_loss, iou = cal_giou_3d(tensor1, tensor1)
-    print(giou_loss)
-    print(iou)
+    # print(giou_loss)
+    # print(iou)

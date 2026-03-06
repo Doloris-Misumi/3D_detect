@@ -31,14 +31,21 @@ class RadarSparseProcessor(nn.Module):
     def forward(self, dict_item):
         if self.type_data == 0:
             sp_cube = dict_item['rdr_sparse_cube'].cuda()
-            B, N, C = sp_cube.shape
-            list_batch_indices = []
-            for batch_idx in range(B):
-                batch_indices = torch.full((N,1), batch_idx, dtype = torch.long)
-                list_batch_indices.append(batch_indices)
-            sp_indices = torch.cat(list_batch_indices).cuda() # (N_1+...+N_B,1) -> 4=idx,z,y,x
-            sp_cube = sp_cube.view(B*N, C) # (N_1+...+N_B,C)
             
+            if len(sp_cube.shape) == 3: # (B, N, C)
+                B, N, C = sp_cube.shape
+                list_batch_indices = []
+                for batch_idx in range(B):
+                    batch_indices = torch.full((N,1), batch_idx, dtype = torch.long)
+                    list_batch_indices.append(batch_indices)
+                sp_indices = torch.cat(list_batch_indices).cuda() # (N_1+...+N_B,1) -> 4=idx,z,y,x
+                sp_cube = sp_cube.view(B*N, C) # (N_1+...+N_B,C)
+            elif len(sp_cube.shape) == 2: # (Total_N, C)
+                # Assumes pts_batch_indices_rdr_sparse_cube exists
+                sp_indices = dict_item['pts_batch_indices_rdr_sparse_cube'].cuda().unsqueeze(-1)
+            else:
+                 print('* Exception error (Pre-processor): check input shape')
+
             # Cut Doppler if self.input_dim = 4
             sp_cube = sp_cube[:,:self.input_dim]
 

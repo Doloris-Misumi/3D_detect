@@ -5,7 +5,7 @@
 '''
 
 import os
-os.environ['CUDA_VISIBLE_DEVICES']= '0'
+# os.environ['CUDA_VISIBLE_DEVICES']= '1'
 
 from pipelines.pipeline_detection_v1_0 import PipelineDetection_v1_0
 
@@ -17,11 +17,16 @@ if __name__ == '__main__':
 
     ### Save this file for checking ###
     import shutil
-    shutil.copy2(os.path.realpath(__file__), os.path.join(pline.path_log, 'executed_code.txt'))
+    if getattr(pline, 'is_logging', False):
+        shutil.copy2(os.path.realpath(__file__), os.path.join(pline.path_log, 'executed_code.txt'))
     ### Save this file for checking ###
 
     pline.train_network()
 
     # conditional evaluation for last epoch
     pline.validate_kitti_conditional(list_conf_thr=[0.3], is_subset=False, is_print_memory=False)
+    
+    if pline.is_distributed:
+        import torch.distributed as dist
+        dist.destroy_process_group()
     

@@ -1,6 +1,13 @@
 import torch
 import torch.nn as nn
 import numpy as np
+import sys
+import os
+import os.path as osp
+
+# Add current directory to sys.path to allow importing cls_model
+sys.path.append(osp.dirname(osp.abspath(__file__)))
+
 from cls_model import ImageClsBackbone
 from torch.utils.data import Dataset
 import torch.nn.functional as F
@@ -70,8 +77,16 @@ class ImgDataset(Dataset):
         for dir_seq in self.cfg.DATASET.DIR.LIST_DIR:
             list_seq = os.listdir(dir_seq)
             for seq in list_seq:
+                if not os.path.isdir(os.path.join(dir_seq, seq)):
+                    continue
+                if seq not in self.dict_split.keys():
+                    continue
                 seq_label_paths = sorted(glob(osp.join(dir_seq, seq, 'info_label', '*.txt')))
                 seq_label_paths = list(filter(lambda x: (x.split('/')[-1].split('.')[0] in self.dict_split[seq]), seq_label_paths))
+                
+                # Check if image file exists
+                seq_label_paths = list(filter(lambda x: self.check_image_exists(x), seq_label_paths))
+                
                 self.list_path_label.extend(seq_label_paths)
                 
                 desc_path = osp.join(dir_seq, seq, 'description.txt')
@@ -98,6 +113,21 @@ class ImgDataset(Dataset):
             dict_seq[seq].append(label)
         return dict_seq
     
+    def check_image_exists(self, path_label):
+        try:
+            seq_id, radar_idx, lidar_idx, camf_idx = self.get_data_indices(path_label)
+            path_header = path_label.split('/')[:-2]
+            path_cam_front = '/'+os.path.join(*path_header, 'cam-front', 'cam-front_'+camf_idx+'.png')
+            if not os.path.exists(path_cam_front):
+                return False
+            # Check validity
+            img = cv2.imread(path_cam_front)
+            if img is None:
+                return False
+            return True
+        except:
+            return False
+
     def get_data_indices(self, path_label):
         f = open(path_label, 'r')
         line = f.readlines()[0]
@@ -114,7 +144,13 @@ class ImgDataset(Dataset):
         path_header = path_label.split('/')[:-2]
         path_cam_front = '/'+os.path.join(*path_header, 'cam-front', 'cam-front_'+camf_idx+'.png')
         
-        image = cv2.imread(path_cam_front)[:,:1280]
+        image = cv2.imread(path_cam_front)
+        if image is None:
+            print(f"Warning: Failed to load image {path_cam_front}")
+            image = np.zeros((720, 1280, 3), dtype=np.uint8)
+        else:
+            image = image[:,:1280]
+            
         label = self.cls_label_list[idx]
         
         if self.transform:
@@ -148,7 +184,7 @@ optimizer = optim.SGD(network.parameters(), lr=0.001, momentum=0.9)
 weather_list = ['normal', 'overcast', 'fog', 'rain', 'sleet', 'light snow', 'heavy snow']
 
 best_acc = 0
-for epoch in range(100):
+for epoch in range(20):
     running_loss = 0.0
     network.train()
     for i, data in tqdm.tqdm(enumerate(trainloader, 0)):

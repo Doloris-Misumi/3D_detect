@@ -7,7 +7,8 @@
 import torch
 import torch.nn as nn
 import numpy as np
-import nms
+# import nms
+import utils.nms_custom as nms
 import time
 
 from utils.Rotated_IoU.oriented_iou_loss import cal_iou
@@ -290,7 +291,8 @@ class RdrSpcubeHead(nn.Module):
         total_loss = loss_cls + loss_reg 
 
         if self.is_logging:
-            dict_item['logging'] = dict()
+            if 'logging' not in dict_item:
+                dict_item['logging'] = dict()
             dict_item['logging'].update(self.logging_dict_loss(total_loss, 'total_loss'))
             dict_item['logging'].update(self.logging_dict_loss(loss_reg, 'loss_reg'))
             dict_item['logging'].update(self.logging_dict_loss(loss_cls, 'focal_loss_cls'))
