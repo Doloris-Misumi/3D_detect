@@ -270,57 +270,44 @@ class RL3DFBackbone_knngate(nn.Module):
 class RL3DFBackbone_Branching(RL3DFBackbone_knngate):
     def __init__(self, cfg):
         super().__init__(cfg)
-        
-        # Branch Router: Condition Token (512) -> Branch Scores (3: Lidar, Radar, Fusion)
+        self.sensor_token_proj = nn.Linear(cfg.MODEL.BACKBONE.ENCODING.CHANNEL[0], 512)
+        left_transformer_layer = nn.TransformerEncoderLayer(
+            d_model=512,
+            nhead=8,
+            dim_feedforward=1024,
+            dropout=0.1,
+            activation='relu'
+        )
+        self.left_transformer = nn.TransformerEncoder(left_transformer_layer, num_layers=2)
+        self.left_transformer_norm = nn.LayerNorm(512)
         self.branch_router = nn.Sequential(
             nn.Linear(512, 256),
             nn.ReLU(),
             nn.Linear(256, 3)
         )
 
-        # Initialize bias to start with equal weights or slight Lidar preference?
-        # Default initialization gives ~0.33 each.
-        # User observed [0.353, 0.352, 0.296] which is close to equal but slightly shifted.
-        # This is expected random initialization behavior.
-        # If user wants specific start, we can set bias here.
-        # For now, let's just make it explicit that it's random if not set.
-        pass
+    def _pool_sparse_tokens(self, features, indices, batch_size):
+        pooled = []
+        for batch_idx in range(batch_size):
+            mask = indices[:, 0] == batch_idx
+            if mask.any():
+                pooled.append(features[mask].mean(dim=0))
+            else:
+                pooled.append(torch.zeros(features.shape[1], device=features.device, dtype=features.dtype))
+        return torch.stack(pooled, dim=0)
         
     def forward(self, dict_item):
         sparse_featuresR, sparse_indicesR = dict_item['sp_features'], dict_item['sp_indices']
         sparse_featuresL, sparse_indicesL = dict_item['sp_features_l'], dict_item['sp_indices_l']
-        
-        # Use Condition Token (img_embedding) for Branch Selection
-        if 'img_embedding' in dict_item:
-            condition_token = dict_item['img_embedding'] # (B, 512)
-        else:
-            condition_token = torch.zeros((dict_item['batch_size'], 512), device=sparse_featuresR.device)
-            
-        # Predict Branch Weights
-        branch_logits = self.branch_router(condition_token) # (B, 3)
-        branch_weights = torch.softmax(branch_logits, dim=-1) # (B, 3)
-        
-        # Store weights for analysis (optional)
-        dict_item['branch_weights'] = branch_weights
-        
-        # --- Weight Distribution Monitor ---
-        # Print monitoring info to terminal
-        if dict_item.get('idx_iter', 0) == 0 and dict_item.get('local_rank', 0) == 0:
-            with torch.no_grad():
-                avg_weights = branch_weights.mean(dim=0)
-                w_L, w_R, w_F = avg_weights[0].item(), avg_weights[1].item(), avg_weights[2].item()
-                
-                weather_str = "Unknown"
-                # Try to retrieve weather info from the first sample in batch
-                if 'meta' in dict_item and len(dict_item['meta']) > 0:
-                    first_meta = dict_item['meta'][0]
-                    if isinstance(first_meta, dict) and 'desc' in first_meta and 'climate' in first_meta['desc']:
-                        weather_str = first_meta['desc']['climate']
-                
-                print(f"[Weight Monitor] Weather: {weather_str:10s} | Lidar: {w_L:.3f} | Radar: {w_R:.3f} | Fusion: {w_F:.3f}")
-        # -----------------------------------
-        
-        # Initialize Inputs
+
+        img_condition_token = dict_item.get('img_embedding', None)
+        prompt_condition_token = dict_item.get('prompt_weather_token', None)
+        if img_condition_token is None:
+            img_condition_token = torch.zeros((dict_item['batch_size'], 512), device=sparse_featuresR.device)
+        if prompt_condition_token is None:
+            prompt_condition_token = img_condition_token
+        condition_token = 0.5 * (img_condition_token + prompt_condition_token)
+
         input_sp_tensorR = spconv.SparseConvTensor(
             features=sparse_featuresR,
             indices=sparse_indicesR.int(),
@@ -337,7 +324,31 @@ class RL3DFBackbone_Branching(RL3DFBackbone_knngate):
         )
         xL = self.input_convL(input_sp_tensorL) 
 
-        # Stream Tensors
+        radar_token = self._pool_sparse_tokens(xR.features, xR.indices, dict_item['batch_size'])
+        lidar_token = self._pool_sparse_tokens(xL.features, xL.indices, dict_item['batch_size'])
+        radar_token = self.sensor_token_proj(radar_token)
+        lidar_token = self.sensor_token_proj(lidar_token)
+
+        tokens = torch.stack((condition_token, radar_token, lidar_token), dim=0)
+        encoded_tokens = self.left_transformer(tokens)
+        condition_token = self.left_transformer_norm(condition_token + encoded_tokens[0])
+        dict_item['condition_token'] = condition_token
+
+        branch_logits = self.branch_router(condition_token)
+        branch_weights = torch.softmax(branch_logits, dim=-1)
+        dict_item['branch_weights'] = branch_weights
+
+        if dict_item.get('idx_iter', 0) == 0 and dict_item.get('local_rank', 0) == 0:
+            with torch.no_grad():
+                avg_weights = branch_weights.mean(dim=0)
+                w_L, w_R, w_F = avg_weights[0].item(), avg_weights[1].item(), avg_weights[2].item()
+                weather_str = "Unknown"
+                if 'meta' in dict_item and len(dict_item['meta']) > 0:
+                    first_meta = dict_item['meta'][0]
+                    if isinstance(first_meta, dict) and 'desc' in first_meta and 'climate' in first_meta['desc']:
+                        weather_str = first_meta['desc']['climate']
+                print(f"[Weight Monitor] Weather: {weather_str:10s} | Lidar: {w_L:.3f} | Radar: {w_R:.3f} | Fusion: {w_F:.3f}")
+
         xL_pure = xL
         xL_fused = xL 
 
@@ -508,4 +519,3 @@ class RL3DFBackbone_Branching(RL3DFBackbone_knngate):
                 
         dict_item['bev_feat'] = final_bev
         return dict_item
-

@@ -865,6 +865,9 @@ class PipelineDetection_v1_0():
                 if (idx_datum % 1000) == 0:
                     torch.cuda.empty_cache()
 
+                dict_datum['idx_iter'] = idx_datum
+                dict_datum['local_rank'] = self.local_rank
+
                 try:
                     dict_out = self.network(dict_datum) # inference
                     is_feature_inferenced = True

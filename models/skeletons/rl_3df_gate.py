@@ -11,9 +11,20 @@ class RL3DF_gate(nn.Module):
         self.cfg = cfg
         self.cfg_model = cfg.MODEL
         
-        # Text Encoder for Contrastive Learning
         self.text_encoder = TextEncoder(freeze=True)
+        self.text_encoder.eval()
         self.logit_scale = nn.Parameter(torch.ones([]) * 2.6592) # ln(14.28)
+        self.weather_vocab = ['normal', 'overcast', 'fog', 'rain', 'sleet', 'lightsnow', 'heavysnow']
+        weather_prompts = [f"A {w} driving scene" for w in self.weather_vocab]
+        with torch.no_grad():
+            weather_features = self.text_encoder(weather_prompts)
+            weather_features = F.normalize(weather_features, dim=-1)
+        self.register_buffer('weather_features', weather_features)
+        self.prompt_token_proj = nn.Sequential(
+            nn.Linear(512, 512),
+            nn.LayerNorm(512),
+            nn.ReLU()
+        )
         
         self.list_module_names = [
             'pre_processor', 'pre_processor2', 'img_cls', 'backbone_3d', 'head', 'roi_head', 
@@ -66,38 +77,36 @@ class RL3DF_gate(nn.Module):
         return head_module
 
     def forward(self, x):
-        # 1. Forward Pass Modules
+        if 'condition_prompts' in x:
+            with torch.no_grad():
+                prompt_features = self.text_encoder(x['condition_prompts'])
+                prompt_features = F.normalize(prompt_features, dim=-1)
+            weather_logits = prompt_features @ self.weather_features.t()
+            weather_probs = torch.softmax(weather_logits, dim=-1)
+            prompt_weather_token = weather_probs @ self.weather_features
+            x['prompt_weather_token'] = self.prompt_token_proj(prompt_weather_token)
+            x['weather_probs'] = weather_probs
+
         for module in self.list_modules:
             x = module(x)
-            
-        # 2. Contrastive Learning (Training Only)
+
         if self.training and 'condition_prompts' in x:
-            # Get Condition Token (CT) from img_cls backbone (assuming it's used as CT generator)
-            # x['img_feat'] is likely the output of img_cls, we need a pooled vector
-            # If img_cls returns a dict or specific tensor, adjust accordingly.
-            # Assuming img_cls adds 'img_embedding' or we pool 'img_feat'
-            
             if 'img_embedding' in x:
-                condition_token = x['img_embedding'] # (B, D)
+                condition_token = x['img_embedding']
             else:
-                # Fallback: Pool from img_feat if available, or skip
-                # This depends on img_cls implementation. Let's assume we modify img_cls later to output this.
                 pass 
             
-            # For now, let's implement the loss calculation assuming we have condition_token
             if 'img_embedding' in x:
-                text_features = self.text_encoder(x['condition_prompts']) # (B, D)
+                with torch.no_grad():
+                    text_features = self.text_encoder(x['condition_prompts'])
                 
-                # Normalize
                 condition_token = F.normalize(condition_token, dim=-1)
                 text_features = F.normalize(text_features, dim=-1)
                 
-                # Cosine similarity as logits
                 logit_scale = self.logit_scale.exp()
                 logits_per_image = logit_scale * condition_token @ text_features.t()
                 logits_per_text = logits_per_image.t()
                 
-                # Contrastive Loss (InfoNCE)
                 batch_size = condition_token.shape[0]
                 labels = torch.arange(batch_size, device=condition_token.device)
                 
@@ -105,20 +114,9 @@ class RL3DF_gate(nn.Module):
                 loss_t2i = F.cross_entropy(logits_per_text, labels)
                 contrastive_loss = (loss_i2t + loss_t2i) / 2
                 
-                # Add to total loss (x is a dict containing 'loss' from head)
-                # Weighted sum: You can tune the weight lambda
                 lambda_contrastive = 0.1 
                 x['contrastive_loss'] = lambda_contrastive * contrastive_loss
-                
-                # Log the loss
                 if 'logging' not in x: x['logging'] = {}
                 x['logging']['loss_contrastive'] = contrastive_loss.item()
-        
-        # 3. Branch Selection (Router) - Placeholder
-        # In a full implementation, we would use the condition_token to select branches here
-        # or inside the backbone_3d module if it supports dynamic routing.
-        # Since backbone_3d is already executed in the loop above, we assume
-        # the routing logic would be integrated into backbone_3d or executed before it.
-        # For this step, we focus on the contrastive learning part as requested.
 
         return x
