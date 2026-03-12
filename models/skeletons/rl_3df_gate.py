@@ -14,6 +14,7 @@ class RL3DF_gate(nn.Module):
         self.text_encoder = TextEncoder(freeze=True)
         self.text_encoder.eval()
         self.logit_scale = nn.Parameter(torch.ones([]) * 2.6592) # ln(14.28)
+        self.lambda_contrastive = float(self.cfg_model.get('LAMBDA_CONTRASTIVE', 0.1))
         self.weather_vocab = ['normal', 'overcast', 'fog', 'rain', 'sleet', 'lightsnow', 'heavysnow']
         weather_prompts = [f"A {w} driving scene" for w in self.weather_vocab]
         with torch.no_grad():
@@ -90,33 +91,29 @@ class RL3DF_gate(nn.Module):
         for module in self.list_modules:
             x = module(x)
 
-        if self.training and 'condition_prompts' in x:
-            if 'img_embedding' in x:
-                condition_token = x['img_embedding']
-            else:
-                pass 
-            
-            if 'img_embedding' in x:
+        if self.training and ('img_embedding' in x) and ('condition_ids' in x):
+            condition_token = F.normalize(x['img_embedding'], dim=-1)
+
+            condition_prompt_vocab = x.get('condition_prompt_vocab', [])
+            if len(condition_prompt_vocab) > 0:
                 with torch.no_grad():
-                    text_features = self.text_encoder(x['condition_prompts'])
-                
-                condition_token = F.normalize(condition_token, dim=-1)
-                text_features = F.normalize(text_features, dim=-1)
-                
+                    condition_text_features = self.text_encoder(condition_prompt_vocab)
+                    condition_text_features = F.normalize(condition_text_features, dim=-1)
+
                 logit_scale = self.logit_scale.exp()
-                logits_per_image = logit_scale * condition_token @ text_features.t()
-                logits_per_text = logits_per_image.t()
-                
-                batch_size = condition_token.shape[0]
-                labels = torch.arange(batch_size, device=condition_token.device)
-                
-                loss_i2t = F.cross_entropy(logits_per_image, labels)
-                loss_t2i = F.cross_entropy(logits_per_text, labels)
-                contrastive_loss = (loss_i2t + loss_t2i) / 2
-                
-                lambda_contrastive = 0.1 
-                x['contrastive_loss'] = lambda_contrastive * contrastive_loss
-                if 'logging' not in x: x['logging'] = {}
-                x['logging']['loss_contrastive'] = contrastive_loss.item()
+                logits = logit_scale * (condition_token @ condition_text_features.t())
+
+                condition_ids = x['condition_ids']
+                if not torch.is_tensor(condition_ids):
+                    condition_ids = torch.tensor(condition_ids, dtype=torch.long)
+                condition_ids = condition_ids.to(condition_token.device).long()
+
+                valid_mask = (condition_ids >= 0) & (condition_ids < condition_text_features.shape[0])
+                if torch.any(valid_mask):
+                    contrastive_loss = F.cross_entropy(logits[valid_mask], condition_ids[valid_mask])
+                    x['contrastive_loss'] = self.lambda_contrastive * contrastive_loss
+                    if 'logging' not in x:
+                        x['logging'] = {}
+                    x['logging']['loss_contrastive'] = contrastive_loss.item()
 
         return x

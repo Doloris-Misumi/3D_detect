@@ -91,7 +91,7 @@ class RdrSpcubeHead(nn.Module):
         ### Loss & Logging ###
 
         ### Anchor map ###
-        self.anchor_map_for_batch = self.create_anchors().cuda() # no batch
+        self.register_buffer('anchor_map_for_batch', self.create_anchors()) # no batch
         ### Anchor map ###
         self.criterion = nn.CrossEntropyLoss()
 
@@ -253,8 +253,9 @@ class RdrSpcubeHead(nn.Module):
                 pos_reg_targ.append(temp_reg_box_targ)
         
         if not is_label_contain_objs: # All batches without objs
-            loss_reg = 0.
-            loss_cls = 0. # focal loss
+            # Keep zero-loss as a tensor attached to graph so DDP ranks remain synchronized.
+            loss_reg = reg_pred.sum() * 0.0
+            loss_cls = cls_pred.sum() * 0.0 # focal loss
         else:
             ### Focal loss ###
             counted_anc_idx = torch.where(anc_idx_targets > -1) # pos and neg boxes only

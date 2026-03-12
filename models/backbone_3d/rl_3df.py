@@ -338,17 +338,6 @@ class RL3DFBackbone_Branching(RL3DFBackbone_knngate):
         branch_weights = torch.softmax(branch_logits, dim=-1)
         dict_item['branch_weights'] = branch_weights
 
-        if dict_item.get('idx_iter', 0) == 0 and dict_item.get('local_rank', 0) == 0:
-            with torch.no_grad():
-                avg_weights = branch_weights.mean(dim=0)
-                w_L, w_R, w_F = avg_weights[0].item(), avg_weights[1].item(), avg_weights[2].item()
-                weather_str = "Unknown"
-                if 'meta' in dict_item and len(dict_item['meta']) > 0:
-                    first_meta = dict_item['meta'][0]
-                    if isinstance(first_meta, dict) and 'desc' in first_meta and 'climate' in first_meta['desc']:
-                        weather_str = first_meta['desc']['climate']
-                print(f"[Weight Monitor] Weather: {weather_str:10s} | Lidar: {w_L:.3f} | Radar: {w_R:.3f} | Fusion: {w_F:.3f}")
-
         xL_pure = xL
         xL_fused = xL 
 

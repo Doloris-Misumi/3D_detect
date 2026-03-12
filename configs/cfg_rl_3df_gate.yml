@@ -8,6 +8,7 @@ GENERAL:
   IS_CUDA_SEED: False
   IS_DETERMINISTIC: True
   DEVICE: 'gpu'
+  DDP_TIMEOUT_MINUTES: 240
   RESUME:
     IS_RESUME: False
     PATH_EXP: # None
@@ -208,26 +209,8 @@ MODEL:
       PADDING: [[0,0], [0,0], [0,0]]
 
   HEAD:
-    NAME: 'TransformerDecoderHead'
-    DIM: 1536 # 256 * 6 (L+R+F) * (1+1+1) ? Wait, let's check backbone output
-    # Backbone outputs concatenation of [bev_feat_R, bev_feat_L] or [bev_feat_R, bev_feat_F] or [zeros, bev_feat_L]
-    # Each bev_feat is 256 channels.
-    # final_bev is cat(R, L) dim. 
-    # R is cat(list_bev_R). list_bev_R has 3 levels? No, just one final output?
-    # Actually RL3DFBackbone_Branching returns dict_item['bev_feat']
-    # Let's re-check the backbone code.
-    # It concatenates 3 levels of features?
-    # No, it seems to be just accumulating list_bev and then cat.
-    # If list_bev has 3 elements (from 3 encoder layers), and each is 256 channels.
-    # Then bev_feat_R is 256*3 = 768.
-    # final_bev is cat(R, L) -> 768 * 2 = 1536.
-    
-    HIDDEN_DIM: 256
-    NUM_QUERIES: 100
-    NHEAD: 8
-    NUM_LAYERS: 3
-    
-    # Original anchors config (kept for reference or if we switch back)
+    NAME: 'RdrSpcubeHead'
+    DIM: 1536  # backbone bev_feat channel
     NMS_OVERLAP_THRESHOLD: 0.3
     BG_WEIGHT: 2
     BOX_CODE: ['x', 'y', 'z', 'w', 'l', 'h', 'sin', 'cos'] # 8
@@ -258,21 +241,22 @@ OPTIMIZER: # Training
   MOMENTUM: 0.9
 
   BATCH_SIZE: 8
-  NUM_WORKERS: 8 # 0 for dataloader_error / 4 for batch 16
+  NUM_WORKERS: 16 # 0 for dataloader_error / 4 for batch 16
 
   MAX_EPOCH: 40
   
   SCHEDULER: 'CosineAnnealingLR' # in [None (empty), 'LambdaLR', 'CosineAnnealingLR']
-  TYPE_TOTAL_ITER: 'all' # in ['every', 'all'] / every epoch
+  TYPE_TOTAL_ITER: 'every' # in ['every', 'all'] / every epoch
 ### ----- Optimizer ----- ###
 
 ### ----- Validation ----- ###
 VAL:
   IS_VALIDATE: True
   IS_CONSIDER_VAL_SUBSET: True
-  VAL_PER_EPOCH_SUBSET: 2
-  NUM_SUBSET: 500 # 5834
-  VAL_PER_EPOCH_FULL: 10 # epoch for validate full dataset
+  VAL_PER_EPOCH_SUBSET: 1
+  NUM_SUBSET: 700
+  FULL_ONLY_AT_END: True
+  VAL_PER_EPOCH_FULL: 40 # used only when FULL_ONLY_AT_END=False
 
   TRAIN_AUG: True
   TEST_AUG: False

@@ -80,7 +80,7 @@ def build_optimizer(p_pline, model):
     ###########################################################################
 
     for name, param in model.named_parameters():
-        if param.requires_grad and 'img_cls' in name:
+        if param.requires_grad and 'img_cls' in name and 'img_cls.ct_proj' not in name:
             param.requires_grad = False
     params = [p for p in model.parameters() if p.requires_grad]
 

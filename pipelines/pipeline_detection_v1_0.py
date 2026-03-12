@@ -16,6 +16,8 @@ from torch.utils.data import Subset
 import cv2
 import matplotlib.pyplot as plt
 import time
+import re
+import datetime
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
@@ -60,7 +62,12 @@ class PipelineDetection_v1_0():
         
         if self.is_distributed:
             torch.cuda.set_device(self.local_rank)
-            dist.init_process_group(backend='nccl', init_method='env://')
+            ddp_timeout_minutes = int(self.cfg.GENERAL.get('DDP_TIMEOUT_MINUTES', 240))
+            dist.init_process_group(
+                backend='nccl',
+                init_method='env://',
+                timeout=datetime.timedelta(minutes=ddp_timeout_minutes),
+            )
             self.device = torch.device(f'cuda:{self.local_rank}')
             print(f'* Init process group: rank {self.local_rank}/{self.world_size}')
         else:
@@ -121,7 +128,8 @@ class PipelineDetection_v1_0():
         # Vis
         self.set_vis()
         
-        self.show_pline_description()
+        if (not self.is_distributed) or self.local_rank == 0:
+            self.show_pline_description()
         
     def update_cfg_regarding_mode(self):
         '''
@@ -153,6 +161,7 @@ class PipelineDetection_v1_0():
         self.val_per_epoch_subset = self.cfg.VAL.VAL_PER_EPOCH_SUBSET
         self.val_num_subset = self.cfg.VAL.NUM_SUBSET
         self.val_per_epoch_full = self.cfg.VAL.VAL_PER_EPOCH_FULL
+        self.val_full_only_at_end = bool(self.cfg.VAL.get('FULL_ONLY_AT_END', True))
 
         self.val_keyword = self.cfg.VAL.CLASS_VAL_KEYWORD # for kitti_eval
         list_val_keyword_keys = list(self.val_keyword.keys()) # same order as VAL.CLASS_VAL_KEYWORD.keys()
@@ -303,6 +312,10 @@ class PipelineDetection_v1_0():
                 self.network.training = True
             
             avg_loss = []
+            branch_monitor = self._init_branch_weight_monitor(
+                num_conditions=getattr(self.dataset_train, 'num_condition_classes', 0),
+                num_bins=50
+            )
             
             # Only show tqdm on rank 0
             if self.local_rank == 0 or not self.is_distributed:
@@ -319,6 +332,11 @@ class PipelineDetection_v1_0():
                 dict_datum['idx_iter'] = idx_iter
                 dict_datum['local_rank'] = self.local_rank
                 dict_net = self.network(dict_datum)
+                batch_branch_log = self._update_branch_weight_monitor(branch_monitor, dict_net)
+                if batch_branch_log:
+                    if 'logging' not in dict_net:
+                        dict_net['logging'] = {}
+                    dict_net['logging'].update(batch_branch_log)
                 
                 # Loss calculation
                 # Accessing .head requires .module in DDP
@@ -348,10 +366,7 @@ class PipelineDetection_v1_0():
                     log_avg_loss = loss
                 avg_loss.append(log_avg_loss)
 
-                if loss == 0.:
-                    pass
-                    # print('loss is 0.') # No objs for all samples
-                elif torch.isfinite(loss):
+                if torch.isfinite(loss):
                     loss.backward()
                 else:
                     print('* Exception error (pipeline): nan or inf loss happend')
@@ -364,13 +379,29 @@ class PipelineDetection_v1_0():
                 self.optimizer.zero_grad()
 
                 if self.is_logging:
-                    dict_logging = dict_net['logging']
+                    dict_logging = dict_net.get('logging', {})
                     idx_log_iter +=1
                     for k, v in dict_logging.items():
                         self.log_train_iter.add_scalar(f'train/{k}', v, idx_log_iter)
                     if not (self.scheduler is None):
                         lr = self.scheduler.get_last_lr()
                         self.log_train_iter.add_scalar(f'train/learning_rate', lr[0], idx_log_iter)
+
+            branch_summary = self._summarize_branch_weight_monitor(branch_monitor)
+            if branch_summary is not None:
+                if self.local_rank == 0 or not self.is_distributed:
+                    self._print_branch_weight_summary(epoch, branch_summary)
+                if self.is_logging and (self.local_rank == 0 or not self.is_distributed):
+                    means = branch_summary['branch_mean']
+                    dom = branch_summary['dominance_ratio']
+                    self.log_train_epoch.add_scalar('train/branch_weight_lidar_epoch_mean', means[0], epoch)
+                    self.log_train_epoch.add_scalar('train/branch_weight_radar_epoch_mean', means[1], epoch)
+                    self.log_train_epoch.add_scalar('train/branch_weight_fusion_epoch_mean', means[2], epoch)
+                    self.log_train_epoch.add_scalar('train/branch_dom_lidar_epoch_ratio', dom[0], epoch)
+                    self.log_train_epoch.add_scalar('train/branch_dom_radar_epoch_ratio', dom[1], epoch)
+                    self.log_train_epoch.add_scalar('train/branch_dom_fusion_epoch_ratio', dom[2], epoch)
+                    self.log_train_epoch.add_scalar('train/branch_entropy_epoch_mean', branch_summary['entropy_mean'], epoch)
+                    self.log_train_epoch.add_scalar('train/branch_max_weight_epoch_mean', branch_summary['max_weight_mean'], epoch)
 
             if getattr(self, 'is_save_model', False):
                 # epoch: indexing from 0
@@ -395,13 +426,301 @@ class PipelineDetection_v1_0():
             if self.is_logging:
                 self.log_train_epoch.add_scalar(f'train/avg_loss', np.mean(avg_loss), epoch)
 
+            if self.is_distributed:
+                dist.barrier()
+
             if self.is_validate:
                 self.network.training=False
                 if self.is_consider_subset:
                     if ((epoch + 1) % self.val_per_epoch_subset) == 0:
                         self.validate_kitti(epoch, list_conf_thr=self.list_val_conf_thr, is_subset=True)
-                if ((epoch + 1) % self.val_per_epoch_full) == 0:
-                    self.validate_kitti(epoch, list_conf_thr=self.list_val_conf_thr)
+                if self.val_full_only_at_end:
+                    if (epoch + 1) == epoch_end:
+                        self.validate_kitti(epoch, list_conf_thr=self.list_val_conf_thr)
+                else:
+                    if ((epoch + 1) % self.val_per_epoch_full) == 0:
+                        self.validate_kitti(epoch, list_conf_thr=self.list_val_conf_thr)
+
+            if self.is_distributed:
+                dist.barrier()
+
+    def _init_branch_weight_monitor(self, num_conditions=0, num_bins=50):
+        monitor = {
+            'num_bins': int(num_bins),
+            'num_conditions': int(max(0, num_conditions)),
+            'count': torch.zeros(1, device=self.device, dtype=torch.float32),
+            'weight_sum': torch.zeros(3, device=self.device, dtype=torch.float32),
+            'weight_sq_sum': torch.zeros(3, device=self.device, dtype=torch.float32),
+            'dominance_count': torch.zeros(3, device=self.device, dtype=torch.float32),
+            'entropy_sum': torch.zeros(1, device=self.device, dtype=torch.float32),
+            'entropy_sq_sum': torch.zeros(1, device=self.device, dtype=torch.float32),
+            'max_weight_sum': torch.zeros(1, device=self.device, dtype=torch.float32),
+            'hist': torch.zeros(3, int(num_bins), device=self.device, dtype=torch.float32),
+        }
+        if monitor['num_conditions'] > 0:
+            monitor['condition_count'] = torch.zeros(
+                monitor['num_conditions'], device=self.device, dtype=torch.float32
+            )
+            monitor['condition_weight_sum'] = torch.zeros(
+                monitor['num_conditions'], 3, device=self.device, dtype=torch.float32
+            )
+        return monitor
+
+    def _update_branch_weight_monitor(self, monitor, dict_net):
+        if ('branch_weights' not in dict_net) or (dict_net['branch_weights'] is None):
+            return {}
+
+        branch_weights = dict_net['branch_weights']
+        if not torch.is_tensor(branch_weights):
+            return {}
+        if branch_weights.ndim != 2 or branch_weights.shape[1] < 3:
+            return {}
+
+        branch_weights = branch_weights[:, :3].detach().to(self.device)
+        branch_weights = branch_weights.clamp(min=0.0)
+        branch_weights = branch_weights / branch_weights.sum(dim=1, keepdim=True).clamp_min(1e-12)
+
+        batch_size = branch_weights.shape[0]
+        if batch_size == 0:
+            return {}
+
+        monitor['count'] += float(batch_size)
+        monitor['weight_sum'] += branch_weights.sum(dim=0)
+        monitor['weight_sq_sum'] += (branch_weights * branch_weights).sum(dim=0)
+        dominance = torch.argmax(branch_weights, dim=1)
+        monitor['dominance_count'] += F.one_hot(dominance, num_classes=3).float().sum(dim=0)
+
+        entropy = -(branch_weights * torch.log(branch_weights.clamp_min(1e-12))).sum(dim=1)
+        entropy = entropy / np.log(3.0)
+        monitor['entropy_sum'] += entropy.sum()
+        monitor['entropy_sq_sum'] += (entropy * entropy).sum()
+        max_weight = branch_weights.max(dim=1).values
+        monitor['max_weight_sum'] += max_weight.sum()
+
+        num_bins = monitor['num_bins']
+        bin_indices = torch.clamp((branch_weights * num_bins).long(), min=0, max=num_bins - 1)
+        ones = torch.ones(batch_size, device=self.device, dtype=torch.float32)
+        for idx_branch in range(3):
+            monitor['hist'][idx_branch].index_add_(0, bin_indices[:, idx_branch], ones)
+
+        if ('condition_ids' in dict_net) and ('condition_count' in monitor):
+            condition_ids = dict_net['condition_ids']
+            if not torch.is_tensor(condition_ids):
+                condition_ids = torch.tensor(condition_ids, dtype=torch.long, device=self.device)
+            condition_ids = condition_ids.long().view(-1).to(self.device)
+            valid = (condition_ids >= 0) & (condition_ids < monitor['num_conditions'])
+            if torch.any(valid):
+                valid_ids = condition_ids[valid]
+                valid_weights = branch_weights[valid]
+                valid_ones = torch.ones(valid_ids.shape[0], device=self.device, dtype=torch.float32)
+                monitor['condition_count'].index_add_(0, valid_ids, valid_ones)
+                monitor['condition_weight_sum'].index_add_(0, valid_ids, valid_weights)
+
+        batch_log = {
+            'branch_weight_lidar': float(branch_weights[:, 0].mean().item()),
+            'branch_weight_radar': float(branch_weights[:, 1].mean().item()),
+            'branch_weight_fusion': float(branch_weights[:, 2].mean().item()),
+            'branch_entropy': float(entropy.mean().item()),
+            'branch_max_weight': float(max_weight.mean().item()),
+        }
+        return batch_log
+
+    def _merge_branch_weight_monitor_ddp(self, monitor):
+        if not self.is_distributed:
+            return
+        tensor_keys = [
+            'count', 'weight_sum', 'weight_sq_sum', 'dominance_count',
+            'entropy_sum', 'entropy_sq_sum', 'max_weight_sum', 'hist'
+        ]
+        for key in tensor_keys:
+            dist.all_reduce(monitor[key], op=dist.ReduceOp.SUM)
+        if 'condition_count' in monitor:
+            dist.all_reduce(monitor['condition_count'], op=dist.ReduceOp.SUM)
+            dist.all_reduce(monitor['condition_weight_sum'], op=dist.ReduceOp.SUM)
+
+    def _hist_quantile(self, hist_row, q):
+        total = hist_row.sum().item()
+        if total <= 0:
+            return float('nan')
+        cdf = torch.cumsum(hist_row, dim=0) / total
+        idx = int(torch.searchsorted(cdf, torch.tensor(q, device=cdf.device), right=False).item())
+        idx = max(0, min(idx, hist_row.shape[0] - 1))
+        return float((idx + 0.5) / hist_row.shape[0])
+
+    def _extract_weather_from_prompt(self, prompt):
+        if not isinstance(prompt, str):
+            return 'unknown'
+        prompt = prompt.strip()
+        # Prompt format: "A {weather} driving scene ..."
+        match = re.search(r'^A\s+(.+?)\s+driving scene', prompt, flags=re.IGNORECASE)
+        if match is None:
+            return 'unknown'
+        weather = match.group(1).strip().lower().replace(' ', '')
+        return weather if len(weather) > 0 else 'unknown'
+
+    def _get_condition_weather_names(self, num_conditions):
+        weather_names = ['unknown'] * int(max(num_conditions, 0))
+        if self.dataset_train is None:
+            return weather_names
+
+        list_condition_tuple = getattr(self.dataset_train, 'list_condition_tuple', None)
+        condition_level = str(getattr(self.dataset_train, 'condition_level', '')).lower()
+        if isinstance(list_condition_tuple, list) and len(list_condition_tuple) >= num_conditions:
+            for idx in range(num_conditions):
+                condition_tuple = list_condition_tuple[idx]
+                weather = 'unknown'
+                if isinstance(condition_tuple, (tuple, list)):
+                    if (condition_level == 'weather_time') and (len(condition_tuple) >= 1):
+                        weather = str(condition_tuple[0]).strip().lower()
+                    elif len(condition_tuple) >= 2:
+                        weather = str(condition_tuple[1]).strip().lower()
+                weather_names[idx] = weather if len(weather) > 0 else 'unknown'
+            return weather_names
+
+        prompt_vocab = getattr(self.dataset_train, 'condition_prompt_vocab', None)
+        if isinstance(prompt_vocab, list):
+            for idx in range(min(num_conditions, len(prompt_vocab))):
+                weather_names[idx] = self._extract_weather_from_prompt(prompt_vocab[idx])
+        return weather_names
+
+    def _summarize_branch_weight_monitor(self, monitor):
+        self._merge_branch_weight_monitor_ddp(monitor)
+        sample_count = float(monitor['count'].item())
+        if sample_count <= 0:
+            return None
+
+        mean = monitor['weight_sum'] / sample_count
+        var = monitor['weight_sq_sum'] / sample_count - mean * mean
+        std = torch.sqrt(torch.clamp(var, min=0.0))
+        dom_ratio = monitor['dominance_count'] / sample_count
+        entropy_mean = float((monitor['entropy_sum'] / sample_count).item())
+        entropy_var = float((monitor['entropy_sq_sum'] / sample_count).item()) - entropy_mean * entropy_mean
+        entropy_std = float(np.sqrt(max(entropy_var, 0.0)))
+        max_weight_mean = float((monitor['max_weight_sum'] / sample_count).item())
+
+        quantiles = []
+        for idx_branch in range(3):
+            hist_row = monitor['hist'][idx_branch]
+            quantiles.append({
+                'p10': self._hist_quantile(hist_row, 0.10),
+                'p50': self._hist_quantile(hist_row, 0.50),
+                'p90': self._hist_quantile(hist_row, 0.90),
+            })
+
+        condition_topk = []
+        weather_breakdown = []
+        if 'condition_count' in monitor:
+            cond_count = monitor['condition_count']
+            non_zero_idx = torch.where(cond_count > 0)[0]
+            if len(non_zero_idx) > 0:
+                topk = min(6, len(non_zero_idx))
+                top_vals, top_pos = torch.topk(cond_count[non_zero_idx], k=topk, largest=True)
+                top_cond_idx = non_zero_idx[top_pos]
+                prompt_vocab = getattr(self.dataset_train, 'condition_prompt_vocab', None)
+                for cidx, cnum in zip(top_cond_idx.tolist(), top_vals.tolist()):
+                    cond_mean_w = (monitor['condition_weight_sum'][cidx] / max(cnum, 1e-12)).tolist()
+                    cond_name = str(cidx)
+                    if prompt_vocab is not None and cidx < len(prompt_vocab):
+                        cond_name = prompt_vocab[cidx]
+                    condition_topk.append({
+                        'condition_id': int(cidx),
+                        'condition_name': cond_name,
+                        'count': int(round(cnum)),
+                        'mean_weights': [float(cond_mean_w[0]), float(cond_mean_w[1]), float(cond_mean_w[2])],
+                    })
+
+            weather_names = self._get_condition_weather_names(cond_count.shape[0])
+            weather_count = {}
+            weather_weight_sum = {}
+            for cidx in range(cond_count.shape[0]):
+                cnum = float(cond_count[cidx].item())
+                if cnum <= 0:
+                    continue
+                weather = weather_names[cidx] if cidx < len(weather_names) else 'unknown'
+                weather = weather if len(weather) > 0 else 'unknown'
+                weather_count[weather] = weather_count.get(weather, 0.0) + cnum
+                if weather not in weather_weight_sum:
+                    weather_weight_sum[weather] = monitor['condition_weight_sum'][cidx].clone()
+                else:
+                    weather_weight_sum[weather] += monitor['condition_weight_sum'][cidx]
+
+            preferred_weather = []
+            weather_list = getattr(self.dataset_train, 'weather_list', None)
+            if isinstance(weather_list, list):
+                preferred_weather = [str(w).strip().lower() for w in weather_list]
+
+            emitted = set()
+            for weather in preferred_weather:
+                cnum = weather_count.get(weather, 0.0)
+                if cnum > 0:
+                    mean_w = (weather_weight_sum[weather] / max(cnum, 1e-12)).tolist()
+                else:
+                    mean_w = [0.0, 0.0, 0.0]
+                weather_breakdown.append({
+                    'weather': weather,
+                    'count': int(round(cnum)),
+                    'mean_weights': [float(mean_w[0]), float(mean_w[1]), float(mean_w[2])],
+                })
+                emitted.add(weather)
+
+            for weather in sorted(weather_count.keys()):
+                if weather in emitted:
+                    continue
+                cnum = weather_count[weather]
+                mean_w = (weather_weight_sum[weather] / max(cnum, 1e-12)).tolist()
+                weather_breakdown.append({
+                    'weather': weather,
+                    'count': int(round(cnum)),
+                    'mean_weights': [float(mean_w[0]), float(mean_w[1]), float(mean_w[2])],
+                })
+
+        summary = {
+            'sample_count': int(round(sample_count)),
+            'branch_mean': [float(mean[0].item()), float(mean[1].item()), float(mean[2].item())],
+            'branch_std': [float(std[0].item()), float(std[1].item()), float(std[2].item())],
+            'dominance_ratio': [float(dom_ratio[0].item()), float(dom_ratio[1].item()), float(dom_ratio[2].item())],
+            'branch_quantiles': quantiles,
+            'entropy_mean': entropy_mean,
+            'entropy_std': entropy_std,
+            'max_weight_mean': max_weight_mean,
+            'condition_topk': condition_topk,
+            'weather_breakdown': weather_breakdown,
+        }
+        return summary
+
+    def _print_branch_weight_summary(self, epoch, summary):
+        names = ['Lidar', 'Radar', 'Fusion']
+        print(f"[Branch Weight Monitor][Epoch {epoch}] samples={summary['sample_count']}")
+        for idx_name, name in enumerate(names):
+            q = summary['branch_quantiles'][idx_name]
+            print(
+                f"  {name:6s} mean={summary['branch_mean'][idx_name]:.4f} std={summary['branch_std'][idx_name]:.4f} "
+                f"p10={q['p10']:.3f} p50={q['p50']:.3f} p90={q['p90']:.3f} "
+                f"dom_ratio={summary['dominance_ratio'][idx_name]:.4f}"
+            )
+        print(
+            f"  Entropy(mean/std)={summary['entropy_mean']:.4f}/{summary['entropy_std']:.4f} "
+            f"MaxWeight(mean)={summary['max_weight_mean']:.4f}"
+        )
+        if summary['condition_topk']:
+            print("  Top conditions by sample count:")
+            for item in summary['condition_topk']:
+                w = item['mean_weights']
+                cond_name = item['condition_name']
+                if len(cond_name) > 80:
+                    cond_name = cond_name[:77] + '...'
+                print(
+                    f"    id={item['condition_id']:2d} count={item['count']:4d} "
+                    f"L/R/F={w[0]:.4f}/{w[1]:.4f}/{w[2]:.4f} | {cond_name}"
+                )
+        if summary.get('weather_breakdown'):
+            print("  Weather breakdown (aggregated over road/time):")
+            for item in summary['weather_breakdown']:
+                w = item['mean_weights']
+                print(
+                    f"    {item['weather']:10s} count={item['count']:4d} "
+                    f"L/R/F={w[0]:.4f}/{w[1]:.4f}/{w[2]:.4f}"
+                )
 
     def load_dict_model(self, path_dict_model, is_strict=False):
         pt_dict_model = torch.load(path_dict_model)
@@ -414,7 +733,8 @@ class PipelineDetection_v1_0():
         * assume batch_size = 1 for convenience
         * vis_mode (TBD)
         '''
-        self.network.eval()
+        model_to_eval = self.network.module if self.is_distributed else self.network
+        model_to_eval.eval()
         
         if is_train:
             dataset_loaded = self.dataset_train
@@ -594,7 +914,8 @@ class PipelineDetection_v1_0():
         if self.is_distributed and self.local_rank != 0:
             return
 
-        self.network.eval()
+        model_to_eval = self.network.module if self.is_distributed else self.network
+        model_to_eval.eval()
 
         with torch.no_grad():
             ### Check is_validate with small dataset ###
@@ -639,7 +960,7 @@ class PipelineDetection_v1_0():
                 try:
                     dict_datum['idx_iter'] = idx_datum
                     dict_datum['local_rank'] = self.local_rank
-                    dict_out = self.network(dict_datum) # inference
+                    dict_out = model_to_eval(dict_datum) # inference
                     is_feature_inferenced = True
                 except:
                     print('* Exception error (Pipeline): error during inferencing a sample -> empty prediction')
@@ -659,7 +980,6 @@ class PipelineDetection_v1_0():
                         os.makedirs(temp_dir, exist_ok=True)
                         
                     if is_feature_inferenced:
-                        model_to_eval = self.network.module if self.is_distributed else self.network
                         dict_out = model_to_eval.list_modules[-1].get_nms_pred_boxes_for_single_sample(dict_out, conf_thr, is_nms=True)
                     else:
                         dict_out = update_dict_feat_not_inferenced(dict_out) # mostly sleet for lpc (e.g. no measurement)
@@ -738,7 +1058,8 @@ class PipelineDetection_v1_0():
         if self.is_distributed and self.local_rank != 0:
             return
             
-        self.network.eval()
+        model_to_eval = self.network.module if self.is_distributed else self.network
+        model_to_eval.eval()
 
         with torch.no_grad():
             road_cond_list = ['urban', 'highway', 'countryside', 'alleyway', 'parkinglots', 'shoulder', 'mountain', 'university']
@@ -869,7 +1190,7 @@ class PipelineDetection_v1_0():
                 dict_datum['local_rank'] = self.local_rank
 
                 try:
-                    dict_out = self.network(dict_datum) # inference
+                    dict_out = model_to_eval(dict_datum) # inference
                     is_feature_inferenced = True
                 except:
                     print('* Exception error (Pipeline): error during inferencing a sample -> empty prediction')
